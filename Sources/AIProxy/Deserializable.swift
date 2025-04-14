@@ -20,26 +20,29 @@ extension Decodable {
         return try self.deserialize(from: data)
     }
 
-    static func deserialize(fromLine line: String) -> Self? {
-        guard line.hasPrefix("data: ") else {
-            // Special case to ignore OpenRouter and DeepSeek SSE comments
-            if line != ": OPENROUTER PROCESSING" && line != ": keep-alive" {
-                logIf(.warning)?.warning("Received unexpected line from aiproxy: \(line)")
-            }
-            return nil
+static func deserialize(fromLine line: String) -> Self? {
+    guard line.hasPrefix("data: ") else {
+        // Special case to ignore OpenRouter and DeepSeek SSE comments
+        if line != ": OPENROUTER PROCESSING" && line != ": keep-alive" {
+            // Be explicit with the enum type: LogLevel.warning
+            logIf(LogLevel.warning)?.warning("Received unexpected line from aiproxy: \(line)")
         }
+        return nil
+    }
 
-        guard line != "data: [DONE]" else {
-            logIf(.debug)?.debug("Streaming response has finished")
-            return nil
-        }
+    guard line != "data: [DONE]" else {
+        // Be explicit with the enum type: LogLevel.debug
+        logIf(LogLevel.debug)?.debug("Streaming response has finished")
+        return nil
+    }
 
-        guard let chunkJSON = line.dropFirst(6).data(using: .utf8),
-              let chunk = try? JSONDecoder().decode(Self.self, from: chunkJSON) else
-        {
-            logIf(.warning)?.warning("Received unexpected JSON from aiproxy: \(line)")
-            return nil
-        }
+    guard let chunkJSON = line.dropFirst(6).data(using: .utf8),
+          let chunk = try? JSONDecoder().decode(Self.self, from: chunkJSON) else
+    {
+        // Be explicit with the enum type: LogLevel.warning
+        logIf(LogLevel.warning)?.warning("Received unexpected JSON from aiproxy: \(line)")
+        return nil
+    }
 
         // if ll(.debug) { aiproxyLogger.debug("Received a chunk: \(line)") }
         return chunk
