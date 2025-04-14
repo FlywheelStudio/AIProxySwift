@@ -1,146 +1,287 @@
 //
 //  RealtimeSession.swift
-//  ... // Other comments
+//  AIProxy
+//
+//  Created by Lou Zell on 11/28/24.
 //
 
-import Foundation
-import AVFoundation // Required for audio handling elsewhere, not directly in this func
-
-// Assume RealtimeActor is defined elsewhere, e.g.:
-// actor RealtimeActor { }
-// typealias RealtimeActor = GlobalActor // Or use a custom actor
-
-// Define the possible messages yielded by the session stream
-public enum OpenAIRealtimeMessage: Sendable {
-    case sessionCreated
-    case sessionUpdated
-    case responseAudioDelta(String) // Base64 Encoded Audio Chunk
-    case responseCreated
-    case inputAudioBufferSpeechStarted
-    case transcriptionDelta(String)
-    case transcriptionCompleted(String)
-    case error(String) // Error description
-    // case unknown(String, [String: Any]) // Optional: If you want to yield unknown types
-}
+import Foundation // <-- Ensure this is present
+import AVFoundation
 
 @RealtimeActor
 open class OpenAIRealtimeSession {
+    private var isTearingDown = false
+    private let webSocketTask: URLSessionWebSocketTask
+    private var continuation: AsyncStream<OpenAIRealtimeMessage>.Continuation?
+    let sessionConfiguration: OpenAIRealtimeSessionConfiguration // Assuming this is initialized elsewhere
 
-    // --- ADDED: Properties required by the function ---
-    private var isTearingDown: Bool = false
-    // Assuming the stream yields OpenAIRealtimeMessage or throws an Error
-    private var continuation: AsyncThrowingStream<OpenAIRealtimeMessage, Error>.Continuation?
-    // You'll need a way to set this continuation when starting the stream, e.g., in an init or connect method
+    // Assuming an initializer exists like this (or similar)
+    init(
+        webSocketTask: URLSessionWebSocketTask,
+        sessionConfiguration: OpenAIRealtimeSessionConfiguration
+    ) {
+        self.webSocketTask = webSocketTask
+        self.sessionConfiguration = sessionConfiguration
 
-    // --- ADDED: Placeholder methods required by the function ---
-    open func disconnect() {
-        print("[OpenAIRealtimeSession] disconnect() called.")
-        // Actual implementation would:
-        // 1. Set isTearingDown = true
-        // 2. Close the WebSocket connection
-        // 3. Finish the continuation: self.continuation?.finish()
-        // 4. Clean up resources
-        self.isTearingDown = true // Mark as tearing down
-        self.continuation?.finish() // Signal end of stream
-        self.continuation = nil // Release continuation
-        // ... (add WebSocket closing logic here) ...
-    }
-
-    private func receiveMessage() {
-        // Check if still connected and not tearing down before scheduling next receive
-        guard !isTearingDown /* && webSocket?.isConnected == true */ else {
-             print("[OpenAIRealtimeSession] Not receiving next message (tearing down or disconnected).")
-             return
+        // Initial setup likely happens here, e.g., sending session.update
+        Task {
+             // Example: Send initial configuration
+             await self.sendMessage(OpenAIRealtimeSessionUpdate(session: self.sessionConfiguration))
         }
-        print("[OpenAIRealtimeSession] receiveMessage() called (placeholder - should listen for next WebSocket message).")
-        // Actual implementation would likely use the WebSocket library's mechanism
-        // to asynchronously wait for the next message, and upon receiving it,
-        // call didReceiveWebSocketData(data) again.
-        // e.g., webSocket?.receive(completionHandler: { [weak self] result in ... self?.didReceiveWebSocketData(...) })
+        self.webSocketTask.resume()
+        self.receiveMessage()
     }
 
-    // --- Original Function (Modified for basic print logging) ---
+    deinit {
+        logIf(.debug)?.debug("OpenAIRealtimeSession is being freed")
+        // Ensure teardown logic if not already handled elsewhere
+        if !isTearingDown {
+            Task { await disconnect() }
+        }
+    }
+
+    /// Messages sent from OpenAI are published on this receiver as they arrive
+    public var receiver: AsyncStream<OpenAIRealtimeMessage> {
+        return AsyncStream { continuation in
+            // Should handle potential multiple assignments carefully if receiver is accessed multiple times
+            self.continuation = continuation
+            // Optional: Handle stream termination
+            continuation.onTermination = { @Sendable [weak self] _ in
+                // Clean up if the stream is terminated externally
+                 logIf(.debug)?.debug("OpenAIRealtimeSession receiver terminated.")
+                 Task { await self?.disconnect() }
+            }
+        }
+    }
+
+    /// Sends a message through the websocket connection
+    public func sendMessage(_ encodable: Encodable) async {
+        guard webSocketTask.closeCode == .invalid else {
+            logIf(.warning)?.warning("Attempted to send message on a closed WebSocket.")
+            return
+        }
+        guard !self.isTearingDown else {
+            logIf(.debug)?.debug("Ignoring ws sendMessage. The RT session is tearing down.")
+            return
+        }
+        do {
+            // Assuming existence of a suitable serialize method (e.g., on Encodable extension)
+            let jsonEncoder = JSONEncoder()
+            // Configure encoder if needed (e.g., key strategies)
+            let jsonData = try jsonEncoder.encode(encodable)
+            guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+                 logIf(.error)?.error("Failed to encode message to UTF8 string.")
+                 return
+            }
+            let wsMessage = URLSessionWebSocketTask.Message.string(jsonString)
+
+            logIf(.debug)?.debug("Sending WebSocket message: \(jsonString)") // Log outgoing message
+            try await self.webSocketTask.send(wsMessage)
+        } catch {
+            logIf(.error)?.error("Could not send message to OpenAI: \(error.localizedDescription)")
+            // Consider yielding an error to the continuation or handling reconnection
+        }
+    }
+
+    /// Close the websocket connection
+    public func disconnect() async {
+         guard !isTearingDown else { return }
+         isTearingDown = true
+         logIf(.debug)?.debug("Disconnecting from realtime session")
+         webSocketTask.cancel(with: .goingAway, reason: nil)
+         continuation?.finish() // Signal end of stream
+         continuation = nil
+    }
+
+
+    // Keep trying to receive messages
+    private func receiveMessage() {
+        guard !isTearingDown && webSocketTask.closeCode == .invalid else {
+            logIf(.debug)?.debug("Not receiving message, session tearing down or closed.")
+            return
+        }
+
+        webSocketTask.receive { [weak self] result in
+            guard let self = self else { return }
+
+            switch result {
+            case .success(let message):
+                switch message {
+                case .string(let text):
+                     logIf(.trace)?.trace("Received WebSocket string: \(text)")
+                    if let data = text.data(using: .utf8) {
+                        self.didReceiveWebSocketData(data)
+                    } else {
+                        logIf(.error)?.error("Failed to convert received WebSocket string to data.")
+                        // Decide how to handle this error (e.g., disconnect, yield error)
+                         self.receiveMessage() // Try to receive next message
+                    }
+                case .data(let data):
+                     logIf(.trace)?.trace("Received WebSocket data: \(data.count) bytes")
+                    self.didReceiveWebSocketData(data)
+                @unknown default:
+                    logIf(.warning)?.warning("Received unknown WebSocket message type")
+                    self.receiveMessage() // Try to receive next message
+                }
+
+            case .failure(let error):
+                 // Handle potential closures and errors
+                 guard !self.isTearingDown else {
+                     logIf(.debug)?.debug("WebSocket receive error during teardown: \(error.localizedDescription)")
+                     return // Expected error during disconnection
+                 }
+
+                let nsError = error as NSError
+                // Ignore "Socket is not connected" (code 57) or POSIX "Connection reset by peer" (code 54) which often happen on disconnect/network change
+                if !(nsError.domain == NSPOSIXErrorDomain && (nsError.code == 54 || nsError.code == 57 || nsError.code == 60)) && // 60 = timeout
+                   !(nsError.domain == NWPOSIXErrorDomain POSIXErrno && (nsError.code == 54 || nsError.code == 57 || nsError.code == 60)) {
+                     logIf(.error)?.error("WebSocket receive error: \(error.localizedDescription)")
+                     self.continuation?.yield(.error("WebSocket receive error: \(error.localizedDescription)"))
+                } else {
+                     logIf(.debug)?.debug("WebSocket receive error (likely disconnect/timeout): \(error.localizedDescription)")
+                }
+                // Consider attempting reconnect or finalize teardown
+                Task { await self.disconnect() } // Disconnect on receive error
+            }
+        }
+    }
+
+
+    // Modified function to handle transcription events
     private func didReceiveWebSocketData(_ data: Data) {
         guard !self.isTearingDown else {
-            print("[OpenAIRealtimeSession] Ignored WebSocket data - tearing down.")
+            // The caller already initiated disconnect, don't send any more messages
             return
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let messageType = json["type"] as? String else {
-            print("[OpenAIRealtimeSession] ERROR: Received websocket data that we don't understand: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
-            // Consider yielding an error instead of just disconnecting?
-            // self.continuation?.finish(throwing: MyDecodingError.invalidJSON) // Example
-            self.disconnect() // Disconnect on unparseable message
+            logIf(.error)?.error("Received websocket data that we don't understand: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+            // Don't disconnect immediately, but maybe yield an error? Or just log.
+            // Attempt to receive the next message in case this was a one-off issue.
+             if !self.isTearingDown { self.receiveMessage() }
             return
         }
-        print("[OpenAIRealtimeSession] DEBUG: Received WebSocket message - Type: \(messageType)") // More specific log
+        logIf(.debug)?.debug("Received WebSocket message - Type: \(messageType)")
 
-        // --- Use the defined enum cases for yielding ---
+        var messageHandled = true // Assume handled unless default case hit without specific handling
+
         switch messageType {
         case "error":
-            let errorBody = String(describing: json["error"] as? [String: Any] ?? json["error"] as? String ?? "Unknown error format")
-            print("[OpenAIRealtimeSession] ERROR: Received error from OpenAI websocket: \(errorBody)")
-            // Yield our specific error case
+            let errorBody = String(describing: json["error"] as? [String: Any])
+            logIf(.error)?.error("Received error event from OpenAI websocket: \(errorBody ?? "No details")")
             self.continuation?.yield(.error(errorBody))
+            // Note: OpenAI might send 'error' and then close, or expect client to close.
+            // We will still call receiveMessage() below to catch potential subsequent messages or closure.
 
         case "session.created":
-            print("[OpenAIRealtimeSession] DEBUG: Yielding .sessionCreated")
+            logIf(.debug)?.debug("Yielding .sessionCreated")
             self.continuation?.yield(.sessionCreated)
 
         case "session.updated":
-             print("[OpenAIRealtimeSession] DEBUG: Yielding .sessionUpdated")
+             logIf(.debug)?.debug("Yielding .sessionUpdated")
             self.continuation?.yield(.sessionUpdated)
 
         case "response.audio.delta":
             if let base64Audio = json["delta"] as? String {
-                 print("[OpenAIRealtimeSession] DEBUG: Yielding .responseAudioDelta (length: \(base64Audio.count))")
+                 logIf(.debug)?.debug("Yielding .responseAudioDelta (length: \(base64Audio.count))")
                 self.continuation?.yield(.responseAudioDelta(base64Audio))
             } else {
-                 print("[OpenAIRealtimeSession] WARNING: Received response.audio.delta event but couldn't extract base64 audio.")
+                 logIf(.warning)?.warning("Received response.audio.delta event but couldn't extract 'delta' field. JSON: \(json)")
             }
 
         case "response.created":
-             print("[OpenAIRealtimeSession] DEBUG: Yielding .responseCreated")
+             logIf(.debug)?.debug("Yielding .responseCreated")
             self.continuation?.yield(.responseCreated)
 
         case "input_audio_buffer.speech_started":
-             print("[OpenAIRealtimeSession] DEBUG: Yielding .inputAudioBufferSpeechStarted")
+             logIf(.debug)?.debug("Yielding .inputAudioBufferSpeechStarted")
             self.continuation?.yield(.inputAudioBufferSpeechStarted)
 
         // --- BEGIN Transcription Handling ---
         case "conversation.item.input_audio_transcription.delta":
+            // Example structure: {"type": "...", "item_id": "...", "content_index": 0, "delta": "hello "}
             if let deltaText = json["delta"] as? String {
-                print("[OpenAIRealtimeSession] DEBUG: Yielding .transcriptionDelta: \(deltaText)")
+                logIf(.debug)?.debug("Yielding .transcriptionDelta: \(deltaText)")
                 self.continuation?.yield(.transcriptionDelta(deltaText))
             } else {
-                print("[OpenAIRealtimeSession] WARNING: Received transcription delta event but couldn't extract 'delta' text. JSON: \(json)")
+                logIf(.warning)?.warning("Received transcription delta event but couldn't extract 'delta' text. JSON: \(json)")
             }
 
         case "conversation.item.input_audio_transcription.completed":
+            // Example structure: {"type": "...", "item_id": "...", "content_index": 0, "transcript": "hello world"}
              if let completedText = json["transcript"] as? String {
-                 print("[OpenAIRealtimeSession] DEBUG: Yielding .transcriptionCompleted: \(completedText)")
+                 logIf(.debug)?.debug("Yielding .transcriptionCompleted: \(completedText)")
                  self.continuation?.yield(.transcriptionCompleted(completedText))
              } else {
-                 print("[OpenAIRealtimeSession] WARNING: Received transcription completed event but couldn't extract 'transcript' text. JSON: \(json)")
+                 logIf(.warning)?.warning("Received transcription completed event but couldn't extract 'transcript' text. JSON: \(json)")
              }
         // --- END Transcription Handling ---
 
+        // TODO: Add cases for other events from OpenAI Realtime API documentation
+        // e.g., input_audio_buffer.speech_stopped, conversation.item.text.delta, etc.
+
         default:
-             // Log unknown types instead of just breaking silently
-             print("[OpenAIRealtimeSession] WARNING: Received unknown message type: \(messageType) - JSON: \(json)")
-             // Optionally yield an unknown case:
-             // self.continuation?.yield(.unknown(messageType, json))
-             break
+             messageHandled = false // Mark as unhandled
+             logIf(.warning)?.warning("Received unknown message type: \(messageType) - JSON: \(json)")
+             // No break here, allow receiveMessage to be called below
         }
 
-        // Only continue listening if it wasn't a fatal error (like undecodable JSON which caused an early return)
-        // Simple "error" messages from OpenAI itself should still allow listening to continue.
-        if !self.isTearingDown { // Check again in case disconnect was called by yield consumer
+        // Always try to receive the next message unless tearing down
+        if !self.isTearingDown {
             self.receiveMessage()
         }
-        // If we disconnected due to bad JSON earlier, receiveMessage() won't be called.
     }
+    
+    // Add any other necessary properties or methods the class originally had.
+    // For example, the `logIf` helper needs to be defined or imported.
+    // Assuming a simple logger utility:
+    // func logIf(_ level: LogLevel) -> Logger? { /* Implementation */ }
+    // enum LogLevel { case trace, debug, warning, error }
+    // protocol Logger { func trace(...), func debug(...), func warning(...), func error(...) }
 
-    // --- Make sure the class has a closing brace ---
-} // End of OpenAIRealtimeSession class
+    // You'll also need the definition for OpenAIRealtimeSessionUpdate if it's used internally
+    // struct OpenAIRealtimeSessionUpdate: Encodable { let session: OpenAIRealtimeSessionConfiguration }
+}
+
+// Helper function/extension needed for `logIf`, assuming it was defined elsewhere in the library
+// This is a placeholder, replace with actual implementation if available
+enum LogLevel { case trace, debug, info, warning, error }
+protocol Logger {
+    func trace(_ message: String)
+    func debug(_ message: String)
+    func info(_ message: String)
+    func warning(_ message: String)
+    func error(_ message: String)
+}
+struct SimpleLogger: Logger { // Example simple logger
+    let level: LogLevel
+    func trace(_ message: String) { if level <= .trace { print("TRACE: \(message)") } }
+    func debug(_ message: String) { if level <= .debug { print("DEBUG: \(message)") } }
+    func info(_ message: String) { if level <= .info { print("INFO: \(message)") } }
+    func warning(_ message: String) { if level <= .warning { print("WARN: \(message)") } }
+    func error(_ message: String) { if level <= .error { print("ERROR: \(message)") } }
+}
+// Assuming log level is set somewhere, maybe globally or per session
+var globalLogLevel: LogLevel = .debug
+func logIf(_ level: LogLevel) -> Logger? {
+    guard level >= globalLogLevel else { return nil }
+    return SimpleLogger(level: level) // Return an instance of your logger
+}
+
+// Placeholder for the session update structure if needed
+struct OpenAIRealtimeSessionUpdate: Encodable { let session: OpenAIRealtimeSessionConfiguration }
+
+// Placeholder for the session configuration if needed
+public struct OpenAIRealtimeSessionConfiguration: Encodable {
+     public let inputAudioFormat: AudioFormat?
+     public let inputAudioTranscription: InputAudioTranscription?
+     public let instructions: String?
+     // Add other fields as defined in the original library
+     
+     // Assuming nested types were defined
+     public enum AudioFormat: String, Encodable { case pcm16 }
+     public struct InputAudioTranscription: Encodable { public let model: String }
+ }
+
+// Add other necessary supporting types/extensions that were originally in this file or module.
