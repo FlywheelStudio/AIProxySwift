@@ -1,114 +1,4 @@
-//
-//  RealtimeSession.swift
-//
-//
-//  Created by Lou Zell on 11/28/24.
-//
-
-import Foundation
-import AVFoundation
-
-@RealtimeActor
-open class OpenAIRealtimeSession {
-    private var isTearingDown = false
-    private let webSocketTask: URLSessionWebSocketTask
-    private var continuation: AsyncStream<OpenAIRealtimeMessage>.Continuation?
-    let sessionConfiguration: OpenAIRealtimeSessionConfiguration
-
-    init(
-        webSocketTask: URLSessionWebSocketTask,
-        sessionConfiguration: OpenAIRealtimeSessionConfiguration
-    ) {
-        self.webSocketTask = webSocketTask
-        self.sessionConfiguration = sessionConfiguration
-
-        Task {
-            await self.sendMessage(OpenAIRealtimeSessionUpdate(session: self.sessionConfiguration))
-        }
-        self.webSocketTask.resume()
-        self.receiveMessage()
-    }
-
-    deinit {
-        logIf(.debug)?.debug("OpenAIRealtimeSession is being freed")
-    }
-
-    /// Messages sent from OpenAI are published on this receiver as they arrive
-    public var receiver: AsyncStream<OpenAIRealtimeMessage> {
-        return AsyncStream { continuation in
-            self.continuation = continuation
-        }
-    }
-
-    /// Sends a message through the websocket connection
-    public func sendMessage(_ encodable: Encodable) async {
-        guard !self.isTearingDown else {
-            logIf(.debug)?.debug("Ignoring ws sendMessage. The RT session is tearing down.")
-            return
-        }
-        do {
-            let wsMessage = URLSessionWebSocketTask.Message.string(try encodable.serialize())
-            try await self.webSocketTask.send(wsMessage)
-        } catch {
-            logIf(.error)?.error("Could not send message to OpenAI: \(error.localizedDescription)")
-        }
-    }
-
-    /// Close the websocket connection
-    public func disconnect() {
-        logIf(.debug)?.debug("Disconnecting from realtime session")
-        self.isTearingDown = true
-        self.continuation?.finish()
-        self.continuation = nil
-        self.webSocketTask.cancel()
-    }
-
-    /// Tells the websocket task to receive a new message
-    private func receiveMessage() {
-        self.webSocketTask.receive { result in
-            switch result {
-            case .failure(let error as NSError):
-                Task {
-                    await self.didReceiveWebSocketError(error)
-                }
-            case .success(let message):
-                Task {
-                    await self.didReceiveWebSocketMessage(message)
-                }
-            }
-        }
-    }
-
-    /// Handles socket errors. We disconnect on all errors.
-    private func didReceiveWebSocketError(_ error: NSError) {
-        guard !isTearingDown else {
-            return
-        }
-        if error.code == 57 {
-            logIf(.warning)?.warning("WS disconnected. Check that your AIProxy project is websocket enabled and you've followed the DeviceCheck integration guide")
-        } else {
-            logIf(.error)?.error("Received ws error: \(error.localizedDescription)")
-        }
-        self.disconnect()
-    }
-
-    /// Handles received websocket messages
-    private func didReceiveWebSocketMessage(_ message: URLSessionWebSocketTask.Message) {
-        switch message {
-        case .string(let text):
-            if let data = text.data(using: .utf8) {
-                self.didReceiveWebSocketData(data)
-            }
-        case .data(let data):
-            self.didReceiveWebSocketData(data)
-        @unknown default:
-            logIf(.error)?.error("Received an unknown websocket message format")
-            self.disconnect()
-        }
-    }
-
-    // TODO: Add the remaining events from this list to the switch statement below:
-    //       https://platform.openai.com/docs/api-reference/realtime-server-events
+    // Modified function to handle transcription events
     private func didReceiveWebSocketData(_ data: Data) {
         guard !self.isTearingDown else {
             // The caller already initiated disconnect,
@@ -118,35 +8,77 @@ open class OpenAIRealtimeSession {
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let messageType = json["type"] as? String else {
-            logIf(.error)?.error("Received websocket data that we don't understand")
+            logIf(.error)?.error("Received websocket data that we don't understand: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+            // Consider yielding an error instead of just disconnecting?
+            // self.continuation?.yield(.error("Undecodable JSON received"))
             self.disconnect()
             return
         }
-        logIf(.debug)?.debug("Received \(messageType) from OpenAI")
+        logIf(.debug)?.debug("Received WebSocket message - Type: \(messageType)") // More specific log
 
         switch messageType {
         case "error":
             let errorBody = String(describing: json["error"] as? [String: Any])
             logIf(.error)?.error("Received error from OpenAI websocket: \(errorBody)")
             self.continuation?.yield(.error(errorBody))
+
         case "session.created":
+            logIf(.debug)?.debug("Yielding .sessionCreated")
             self.continuation?.yield(.sessionCreated)
+
         case "session.updated":
+             logIf(.debug)?.debug("Yielding .sessionUpdated")
             self.continuation?.yield(.sessionUpdated)
+
         case "response.audio.delta":
             if let base64Audio = json["delta"] as? String {
+                 logIf(.debug)?.debug("Yielding .responseAudioDelta (length: \(base64Audio.count))")
                 self.continuation?.yield(.responseAudioDelta(base64Audio))
+            } else {
+                 logIf(.warning)?.warning("Received response.audio.delta event but couldn't extract base64 audio.")
             }
+
         case "response.created":
+             logIf(.debug)?.debug("Yielding .responseCreated")
             self.continuation?.yield(.responseCreated)
+
         case "input_audio_buffer.speech_started":
+             logIf(.debug)?.debug("Yielding .inputAudioBufferSpeechStarted")
             self.continuation?.yield(.inputAudioBufferSpeechStarted)
+
+        // --- BEGIN Transcription Handling ---
+        case "conversation.item.input_audio_transcription.delta":
+            if let deltaText = json["delta"] as? String {
+                logIf(.debug)?.debug("Yielding .transcriptionDelta: \(deltaText)")
+                self.continuation?.yield(.transcriptionDelta(deltaText))
+            } else {
+                logIf(.warning)?.warning("Received transcription delta event but couldn't extract 'delta' text. JSON: \(json)")
+            }
+
+        case "conversation.item.input_audio_transcription.completed":
+             if let completedText = json["transcript"] as? String {
+                 logIf(.debug)?.debug("Yielding .transcriptionCompleted: \(completedText)")
+                 self.continuation?.yield(.transcriptionCompleted(completedText))
+             } else {
+                 logIf(.warning)?.warning("Received transcription completed event but couldn't extract 'transcript' text. JSON: \(json)")
+             }
+        // --- END Transcription Handling ---
+
         default:
-            break
+             // Log unknown types instead of just breaking silently
+             logIf(.warning)?.warning("Received unknown message type: \(messageType) - JSON: \(json)")
+             // Optionally, you could add an `.unknown(String, [String: Any])` case to OpenAIRealtimeMessage
+             // and yield it here if you want the client code to be aware of unknown events.
+             break
         }
 
+        // Only continue listening if it wasn't a fatal error (like undecodable JSON)
+        // Simple "error" messages from OpenAI itself should still allow listening to continue.
         if messageType != "error" && !self.isTearingDown {
             self.receiveMessage()
+        } else if messageType == "error" && !self.isTearingDown {
+            // If it was an OpenAI domain error, still try to receive the next message
+             self.receiveMessage()
         }
+        // If we disconnected due to bad JSON earlier, receiveMessage() won't be called.
     }
-}
