@@ -1,4 +1,4 @@
-//
+e//
 //  ReplicateService.swift
 //
 //
@@ -464,7 +464,7 @@ extension ReplicateService {
 extension ReplicateService {
     internal func safeSecondsToWait(_ secondsToWait: UInt, warn: Bool = false) -> UInt {
         if secondsToWait > 60 && warn {
-            logIf(.warning)?.warning(
+          logIf(LogLevel.warning)?.warning(               
                 """
                 The replicate sync API can not wait longer than 60 seconds.
                 Please use the convenience method XYZ, which will fall back to polling after 60 seconds ellapses.
