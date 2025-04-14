@@ -32,7 +32,7 @@ private func deliver(_ payload: Payload, clientID: String?) {
     if let req = buildRequest(payload, clientID: clientID) {
         Task {
             if let (_, res) = try? await BackgroundNetworker.makeRequestAndWaitForData(session, req) {
-                logIf(.debug)?.debug("Fired logging event and received status code \(res.statusCode)")
+                logIf(AIProxyLogLevel.debug)?.debug("Fired logging event and received status code \(res.statusCode)")
             }
         }
     }
