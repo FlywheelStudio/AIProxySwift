@@ -24,11 +24,11 @@ open class OpenAIRealtimeSession {
         self.webSocketTask = webSocketTask
         self.sessionConfiguration = sessionConfiguration
 
-        // Initial setup likely happens here, e.g., sending session.update
-        Task {
-             // Example: Send initial configuration
-             await self.sendMessage(OpenAIRealtimeSessionUpdate(session: self.sessionConfiguration))
-        }
+        // Initial setup is moved to handle session.created message
+        // Task {
+        //      // Example: Send initial configuration
+        //      await self.sendMessage(OpenAIRealtimeSessionUpdate(session: self.sessionConfiguration))
+        // }
         self.webSocketTask.resume()
         self.receiveMessage()
     }
@@ -175,7 +175,8 @@ open class OpenAIRealtimeSession {
             // We will still call receiveMessage() below to catch potential subsequent messages or closure.
 
         case "session.created":
-            logIf(AIProxyLogLevel.debug)?.debug("Yielding .sessionCreated")
+            logIf(AIProxyLogLevel.debug)?.debug("Yielding .sessionCreated and sending configuration update...")
+            Task { await self.sendMessage(OpenAIRealtimeSessionUpdate(session: self.sessionConfiguration)) }
             self.continuation?.yield(.sessionCreated)
 
         case "session.updated":
