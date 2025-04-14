@@ -1,4 +1,15 @@
-    // Modified function to handle transcription events
+//
+//  RealtimeSession.swift
+//  ... // Other comments
+//
+
+import Foundation // <--- ADD THIS LINE
+import AVFoundation // This should already be there
+
+@RealtimeActor
+open class OpenAIRealtimeSession {
+
+// Modified function to handle transcription events
     private func didReceiveWebSocketData(_ data: Data) {
         guard !self.isTearingDown else {
             // The caller already initiated disconnect,
